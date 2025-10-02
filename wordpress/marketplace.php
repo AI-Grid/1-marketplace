@@ -2,7 +2,7 @@
 <?php
 /*
 Plugin Name: OpenSim Marketplace
-Description: Marketplace for OpenSim prims with Corrade God-copy delivery, orders, redelivery, and logs. Includes front-end buy page, advanced ignore filters, ignore rules by UUID or Name (exact/contains), user balance display, bulk-trash for ignored items, editor UI, and dark mode UI.
+Description: Marketplace for OpenSim prims with PHP delivery API fulfilment, order management, redelivery, and comprehensive admin tools. Includes front-end buy page, advanced ignore filters, ignore rules by UUID or Name (exact/contains), user balance display, bulk-trash for ignored items, editor UI, and dark mode UI.
 Version: 1.9
 Author: Tasia
 Requires PHP: 8.0
@@ -22,9 +22,8 @@ add_filter('cron_schedules', function($schedules) {
 class OpenSimMarketplace {
     private ?mysqli $os_db = null;
     private ?mysqli $money_db = null;
-    private string $corrade_url = '';
-    private string $corrade_group = '';
-    private string $corrade_password = '';
+    private string $api_base_url = '';
+    private string $api_shared_secret = '';
     private string $region_uuid = '';
     private array $ignore_list = [];
     private string $plugin_version = '1.9';
@@ -82,11 +81,10 @@ class OpenSimMarketplace {
 
     // ---- Initialization ----
     private function init_config(): void {
-        $this->corrade_url      = get_option('osmp_corrade_url', 'http://127.0.0.1:8000');
-        $this->corrade_group    = get_option('osmp_corrade_group', 'MarketplaceBot');
-        $this->corrade_password = get_option('osmp_corrade_password', '');
-        $this->region_uuid      = get_option('osmp_region_uuid', '');
-        $this->ignore_list      = get_option('osmp_ignore_list', []); // legacy option only
+        $this->api_base_url       = get_option('osmp_api_base_url', '');
+        $this->api_shared_secret  = get_option('osmp_api_shared_secret', '');
+        $this->region_uuid        = get_option('osmp_region_uuid', '');
+        $this->ignore_list        = get_option('osmp_ignore_list', []); // legacy option only
     }
 
     private function init_database_connections(): void {
@@ -217,6 +215,7 @@ class OpenSimMarketplace {
             prim_uuid varchar(36) NOT NULL,
             status varchar(20) NOT NULL,
             message text,
+            correlation_id varchar(100) DEFAULT NULL,
             created_at timestamp DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id),
             KEY order_id (order_id),
@@ -832,9 +831,8 @@ class OpenSimMarketplace {
         if (!current_user_can('manage_options')) wp_die(__('You do not have sufficient permissions to access this page.'));
 
         if (isset($_POST['submit']) && check_admin_referer('osmp_settings', '_wpnonce')) {
-            update_option('osmp_corrade_url', esc_url_raw($_POST['osmp_corrade_url']));
-            update_option('osmp_corrade_group', sanitize_text_field($_POST['osmp_corrade_group']));
-            update_option('osmp_corrade_password', sanitize_text_field($_POST['osmp_corrade_password']));
+            update_option('osmp_api_base_url', esc_url_raw($_POST['osmp_api_base_url'] ?? ''));
+            update_option('osmp_api_shared_secret', sanitize_text_field($_POST['osmp_api_shared_secret'] ?? ''));
             update_option('osmp_region_uuid', sanitize_text_field($_POST['osmp_region_uuid']));
             update_option('osmp_os_db_host', sanitize_text_field($_POST['osmp_os_db_host']));
             update_option('osmp_os_db_user', sanitize_text_field($_POST['osmp_os_db_user']));
@@ -857,11 +855,10 @@ class OpenSimMarketplace {
             <form method="post" action="">
                 <?php wp_nonce_field('osmp_settings'); ?>
 
-                <h2>Corrade Bot Configuration</h2>
+                <h2>Delivery API Configuration</h2>
                 <table class="form-table">
-                    <tr><th><label for="osmp_corrade_url">Corrade URL</label></th><td><input type="url" id="osmp_corrade_url" name="osmp_corrade_url" value="<?php echo esc_attr(get_option('osmp_corrade_url', 'http://127.0.0.1:8000')); ?>" class="regular-text" /></td></tr>
-                    <tr><th><label for="osmp_corrade_group">Corrade Group</label></th><td><input type="text" id="osmp_corrade_group" name="osmp_corrade_group" value="<?php echo esc_attr(get_option('osmp_corrade_group', 'MarketplaceBot')); ?>" class="regular-text" /></td></tr>
-                    <tr><th><label for="osmp_corrade_password">Corrade Password</label></th><td><input type="password" id="osmp_corrade_password" name="osmp_corrade_password" value="<?php echo esc_attr(get_option('osmp_corrade_password')); ?>" class="regular-text" /></td></tr>
+                    <tr><th><label for="osmp_api_base_url">PHP Delivery API Base URL</label></th><td><input type="url" id="osmp_api_base_url" name="osmp_api_base_url" value="<?php echo esc_attr(get_option('osmp_api_base_url', '')); ?>" class="regular-text" placeholder="https://delivery.example.com/api" /><p class="description">The plugin will call the <code>deliver</code> endpoint on this base URL for every purchase and redelivery.</p></td></tr>
+                    <tr><th><label for="osmp_api_shared_secret">Delivery API Shared Secret</label></th><td><input type="password" id="osmp_api_shared_secret" name="osmp_api_shared_secret" value="<?php echo esc_attr(get_option('osmp_api_shared_secret', '')); ?>" class="regular-text" /><p class="description">Must match the shared secret configured on the PHP delivery backend.</p></td></tr>
                     <tr><th><label for="osmp_region_uuid">Region UUID</label></th><td><input type="text" id="osmp_region_uuid" name="osmp_region_uuid" value="<?php echo esc_attr(get_option('osmp_region_uuid')); ?>" class="regular-text" /></td></tr>
                 </table>
 
@@ -1467,10 +1464,15 @@ class OpenSimMarketplace {
             $delivery_result = $this->deliver_item($prim_uuid, $buyer_uuid);
             $this->log_delivery($order_id, $prim_uuid, $buyer_uuid, $delivery_result);
 
+            if ($delivery_result['status'] !== 'delivered') {
+                wp_send_json_error($delivery_result['message']);
+            }
+
             wp_send_json_success([
-                'status'   => $delivery_result['status'],
-                'message'  => $delivery_result['message'],
-                'order_id' => $order_id
+                'status'         => $delivery_result['status'],
+                'message'        => $delivery_result['message'],
+                'order_id'       => $order_id,
+                'correlation_id' => $delivery_result['correlation_id'] ?? '',
             ]);
         } catch (Throwable $e) {
             if ($this->money_db) $this->money_db->rollback();
@@ -1481,42 +1483,62 @@ class OpenSimMarketplace {
 
     private function deliver_item(string $prim_uuid, string $buyer_uuid): array {
         try {
-            $copy_payload = [
-                'command'  => 'copy',
-                'group'    => $this->corrade_group,
-                'password' => $this->corrade_password,
-                'item'     => $prim_uuid,
-                'folder'   => '/Marketplace/Outgoing'
+            if (empty($this->api_base_url) || empty($this->api_shared_secret)) {
+                throw new Exception('Delivery API is not configured');
+            }
+
+            $endpoint = trailingslashit($this->api_base_url) . 'deliver';
+            $payload = [
+                'buyer_uuid'    => $buyer_uuid,
+                'asset_id'      => $prim_uuid,
+                'shared_secret' => $this->api_shared_secret,
             ];
-            $copy_response = wp_remote_post($this->corrade_url, [
-                'body' => $copy_payload, 'timeout' => 30,
-                'headers' => ['Content-Type' => 'application/x-www-form-urlencoded']
+
+            $response = wp_remote_post($endpoint, [
+                'body'    => wp_json_encode($payload),
+                'timeout' => 30,
+                'headers' => ['Content-Type' => 'application/json'],
             ]);
-            if (is_wp_error($copy_response)) throw new Exception('Copy request failed: ' . $copy_response->get_error_message());
-            $copy_data = json_decode(wp_remote_retrieve_body($copy_response), true);
-            if (!$copy_data || (isset($copy_data['success']) && !$copy_data['success'])) throw new Exception('Copy operation failed: ' . ($copy_data['error'] ?? 'Unknown error'));
 
-            sleep(1);
+            if (is_wp_error($response)) {
+                throw new Exception('Delivery request failed: ' . $response->get_error_message());
+            }
 
-            $give_payload = [
-                'command'  => 'give',
-                'group'    => $this->corrade_group,
-                'password' => $this->corrade_password,
-                'item'     => "/Marketplace/Outgoing/{$prim_uuid}",
-                'entity'   => $buyer_uuid
-            ];
-            $give_response = wp_remote_post($this->corrade_url, [
-                'body' => $give_payload, 'timeout' => 30,
-                'headers' => ['Content-Type' => 'application/x-www-form-urlencoded']
-            ]);
-            if (is_wp_error($give_response)) throw new Exception('Give request failed: ' . $give_response->get_error_message());
-            $give_data = json_decode(wp_remote_retrieve_body($give_response), true);
-            if (!$give_data || (isset($give_data['success']) && !$give_data['success'])) throw new Exception('Give operation failed: ' . ($give_data['error'] ?? 'Unknown error'));
+            $code = wp_remote_retrieve_response_code($response);
+            $body = wp_remote_retrieve_body($response);
+            $data = json_decode($body, true);
 
-            return ['status' => 'delivered', 'message' => 'Item delivered successfully via Corrade'];
+            if ($code < 200 || $code >= 300) {
+                $error_message = $data['error'] ?? $data['message'] ?? 'Unexpected response from delivery service';
+                throw new Exception($error_message);
+            }
+
+            if (!is_array($data)) {
+                throw new Exception('Invalid response payload from delivery service');
+            }
+
+            if (!empty($data['success']) && $data['success'] === true) {
+                $message = $data['message'] ?? 'Item delivered successfully via delivery API';
+                $correlation = $data['correlation_id'] ?? '';
+                if ($correlation) {
+                    error_log('OpenSim Marketplace delivery correlation ID: ' . $correlation);
+                }
+                return [
+                    'status'         => 'delivered',
+                    'message'        => $message,
+                    'correlation_id' => $correlation,
+                ];
+            }
+
+            $error_message = $data['error'] ?? $data['message'] ?? 'Delivery failed without error message';
+            throw new Exception($error_message);
         } catch (Throwable $e) {
             error_log('OpenSim Marketplace delivery error: ' . $e->getMessage());
-            return ['status' => 'failed', 'message' => 'Delivery failed: ' . $e->getMessage()];
+            return [
+                'status'         => 'failed',
+                'message'        => 'Delivery failed: ' . $e->getMessage(),
+                'correlation_id' => '',
+            ];
         }
     }
 
@@ -1524,9 +1546,10 @@ class OpenSimMarketplace {
         if (!$this->money_db) return;
         try {
             $logs_table = 'wp_market_delivery_logs';
-            $stmt = $this->money_db->prepare("INSERT INTO `{$logs_table}` (order_id, prim_uuid, buyer_uuid, status, message, created_at) VALUES (?, ?, ?, ?, ?, NOW())");
+            $stmt = $this->money_db->prepare("INSERT INTO `{$logs_table}` (order_id, prim_uuid, buyer_uuid, status, message, correlation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW())");
             if ($stmt) {
-                $stmt->bind_param('issss', $order_id, $prim_uuid, $buyer_uuid, $result['status'], $result['message']);
+                $correlation = $result['correlation_id'] ?? '';
+                $stmt->bind_param('isssss', $order_id, $prim_uuid, $buyer_uuid, $result['status'], $result['message'], $correlation);
                 $stmt->execute(); $stmt->close();
 
                 if ($result['status'] === 'delivered') {
@@ -1557,8 +1580,16 @@ class OpenSimMarketplace {
             $delivery_result = $this->deliver_item($order['prim_uuid'], $order['buyer_uuid']);
             $this->log_delivery($order_id, $order['prim_uuid'], $order['buyer_uuid'], $delivery_result);
 
-            if ($delivery_result['status'] === 'delivered') echo '<div class="notice notice-success"><p>Item redelivered successfully</p></div>';
-            else echo '<div class="notice notice-error"><p>Redelivery failed: ' . esc_html($delivery_result['message']) . '</p></div>';
+            if ($delivery_result['status'] === 'delivered') {
+                $message = esc_html($delivery_result['message']);
+                $correlation = $delivery_result['correlation_id'] ?? '';
+                if (!empty($correlation)) {
+                    $message .= ' (Correlation ID: ' . esc_html($correlation) . ')';
+                }
+                echo '<div class="notice notice-success"><p>' . $message . '</p></div>';
+            } else {
+                echo '<div class="notice notice-error"><p>' . esc_html($delivery_result['message']) . '</p></div>';
+            }
         } catch (Throwable $e) {
             error_log('OpenSim Marketplace redelivery error: ' . $e->getMessage());
             echo '<div class="notice notice-error"><p>Redelivery failed: ' . esc_html($e->getMessage()) . '</p></div>';
