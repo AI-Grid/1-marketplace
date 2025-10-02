@@ -1,0 +1,9 @@
+[UuidPasswordContentDelivery]
+Enabled = true
+PhpApiBaseUrl = "https://content.example.com"
+SharedSecret = "CHANGE_ME"
+RequestTimeoutMs = 5000
+MaxRetries = 2
+ProxyBinary = false
+RateLimitBackoffMs = 500
+LoggingLevel = "INFO"
