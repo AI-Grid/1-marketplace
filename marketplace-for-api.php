@@ -1004,6 +1004,28 @@ class OpenSimMarketplace {
             }
         }
 
+        if (isset($_POST['osmp_remove_duplicates'])) {
+            check_admin_referer('osmp_remove_duplicates', '_wpnonce_osmp_remove_duplicates');
+            $dedupe_result = $this->remove_duplicate_items();
+
+            $summary = sprintf(
+                'Checked %d prim UUID groups. Removed %d duplicate items%s.',
+                $dedupe_result['groups'],
+                $dedupe_result['removed'],
+                $dedupe_result['errors'] > 0
+                    ? sprintf(' (%d items could not be trashed; see debug.log)', $dedupe_result['errors'])
+                    : ''
+            );
+
+            $highlight = '';
+            if (!empty($dedupe_result['prim_uuids'])) {
+                $sample = array_slice($dedupe_result['prim_uuids'], 0, 5);
+                $highlight = '<br><em>Affected prim UUIDs (sample): ' . esc_html(implode(', ', $sample)) . '</em>';
+            }
+
+            echo '<div class="notice notice-success"><p>' . esc_html($summary) . $highlight . '</p></div>';
+        }
+
         // Manual sync trigger
         if (isset($_POST['osmp_sync_now']) && check_admin_referer('osmp_sync_now', '_wpnonce_osmp_sync')) {
             $regions_to_sync = [];
@@ -1060,6 +1082,11 @@ class OpenSimMarketplace {
         }
 
         echo '<input type="submit" class="button" name="osmp_sync_now" value="Sync Now">';
+        echo '</form></p>';
+
+        echo '<p><form method="post" style="display:inline-block;margin-right:10px">';
+        wp_nonce_field('osmp_remove_duplicates', '_wpnonce_osmp_remove_duplicates');
+        echo '<input type="submit" class="button" name="osmp_remove_duplicates" value="Remove Duplicate Items">';
         echo '</form></p>';
 
         echo '<h2 class="nav-tab-wrapper">';
@@ -1781,6 +1808,75 @@ class OpenSimMarketplace {
         if ($should_reschedule) {
             wp_schedule_single_event(time() + 1, 'osmp_cron_import');
         }
+    }
+
+    private function remove_duplicate_items(): array {
+        global $wpdb;
+
+        $result = [
+            'groups'     => 0,
+            'removed'    => 0,
+            'errors'     => 0,
+            'prim_uuids' => [],
+        ];
+
+        try {
+            $query = $wpdb->prepare(
+                "SELECT pm.meta_value AS prim_uuid,
+                        GROUP_CONCAT(pm.post_id ORDER BY p.post_date ASC SEPARATOR ',') AS post_ids,
+                        COUNT(*) AS duplicates
+                   FROM {$wpdb->postmeta} pm
+                   INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+                  WHERE pm.meta_key = %s
+                    AND p.post_type = %s
+                    AND p.post_status <> 'trash'
+                    AND pm.meta_value <> ''
+               GROUP BY pm.meta_value
+                 HAVING COUNT(*) > 1",
+                '_prim_uuid',
+                'opensim_item'
+            );
+
+            $rows = (array) $wpdb->get_results($query);
+
+            foreach ($rows as $row) {
+                $prim_uuid = (string) $row->prim_uuid;
+                if (!$this->is_valid_uuid($prim_uuid)) {
+                    continue;
+                }
+
+                $ids = array_filter(array_map('intval', explode(',', (string) $row->post_ids)));
+                if (count($ids) < 2) {
+                    continue;
+                }
+
+                $result['groups']++;
+                $result['prim_uuids'][] = $prim_uuid;
+
+                $keep_id = array_shift($ids);
+
+                foreach ($ids as $post_id) {
+                    if ($post_id === $keep_id) {
+                        continue;
+                    }
+
+                    $trashed = wp_trash_post($post_id);
+                    if ($trashed instanceof \WP_Post || $trashed === true) {
+                        $result['removed']++;
+                    } elseif ($trashed instanceof \WP_Error) {
+                        $result['errors']++;
+                        error_log('OpenSim Marketplace: Failed to trash duplicate post ' . $post_id . ' for prim ' . $prim_uuid . ': ' . $trashed->get_error_message());
+                    } else {
+                        $result['errors']++;
+                        error_log('OpenSim Marketplace: Failed to trash duplicate post ' . $post_id . ' for prim ' . $prim_uuid);
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            error_log('OpenSim Marketplace: Error removing duplicate items: ' . $e->getMessage());
+        }
+
+        return $result;
     }
 
     // ---- Purchase Handling ----
