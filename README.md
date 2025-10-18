@@ -125,4 +125,3 @@ Both suites provide coverage for request validation, token issuance, signed URL 
 - Update dependencies via `composer update` and `dotnet restore` as needed.
 - Rotate `HMAC_SECRET` periodically and sync with OpenSim configuration.
 - Purge expired tokens with a scheduled job (`DELETE FROM auth_tokens WHERE expires_at < NOW()`).
-
