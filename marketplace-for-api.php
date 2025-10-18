@@ -25,6 +25,7 @@ class OpenSimMarketplace {
     private string $delivery_api_url = '';
     private string $delivery_api_password = '';
     private array $region_uuids = [];
+    private array $region_labels = [];
     private string $region_uuid = '';
     private array $ignore_list = [];
     private string $plugin_version = '2.0';
@@ -90,6 +91,7 @@ class OpenSimMarketplace {
 
         $this->delivery_api_password = $this->decrypt_option('osmp_delivery_api_password', '');
 
+        $this->region_labels = [];
         $raw_regions = get_option('osmp_region_uuids', '');
         if (is_array($raw_regions)) {
             $raw_list = $raw_regions;
@@ -97,18 +99,25 @@ class OpenSimMarketplace {
             $raw_list = preg_split('/[\r\n,]+/', (string) $raw_regions) ?: [];
         }
 
-        $candidate_regions = [];
+        $valid_regions = [];
         foreach ($raw_list as $value) {
             $value = trim((string) $value);
-            if ($value !== '') {
-                $candidate_regions[] = $value;
+            if ($value === '') {
+                continue;
             }
-        }
 
-        $valid_regions = [];
-        foreach ($candidate_regions as $region) {
-            if ($this->is_valid_uuid($region)) {
-                $valid_regions[] = $region;
+            $uuid_part  = $value;
+            $label_part = '';
+            if (strpos($value, '|') !== false) {
+                [$uuid_part, $label_part] = array_map('trim', explode('|', $value, 2));
+            }
+
+            if ($this->is_valid_uuid($uuid_part)) {
+                $normalized = strtolower($uuid_part);
+                if (!isset($this->region_labels[$normalized])) {
+                    $valid_regions[] = $uuid_part;
+                    $this->region_labels[$normalized] = $label_part !== '' ? $label_part : $uuid_part;
+                }
             }
         }
 
@@ -116,10 +125,11 @@ class OpenSimMarketplace {
             $fallback_region = (string) get_option('osmp_region_uuid', '');
             if ($this->is_valid_uuid($fallback_region)) {
                 $valid_regions[] = $fallback_region;
+                $this->region_labels[strtolower($fallback_region)] = $fallback_region;
             }
         }
 
-        $this->region_uuids = array_values(array_unique($valid_regions));
+        $this->region_uuids = array_values($valid_regions);
         $this->region_uuid  = $this->region_uuids[0] ?? (string) get_option('osmp_region_uuid', '');
         if ($this->region_uuid !== '' && !$this->is_valid_uuid($this->region_uuid)) {
             $this->region_uuid = '';
@@ -205,6 +215,20 @@ class OpenSimMarketplace {
 
     private function is_valid_uuid(string $uuid): bool {
         return (bool) preg_match('/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i', $uuid);
+    }
+
+    private function get_region_label(string $uuid): string {
+        $uuid = trim($uuid);
+        if ($uuid === '') {
+            return '';
+        }
+
+        $normalized = strtolower($uuid);
+        if (isset($this->region_labels[$normalized]) && $this->region_labels[$normalized] !== '') {
+            return $this->region_labels[$normalized];
+        }
+
+        return $uuid;
     }
 
     // ---- Tables ----
@@ -375,6 +399,7 @@ class OpenSimMarketplace {
                 $new['osmp_price'] = 'Price';
                 $new['osmp_forsale'] = 'For Sale';
                 $new['osmp_prim_uuid'] = 'Prim UUID';
+                $new['osmp_region'] = 'Region';
             }
         }
         return $new;
@@ -393,6 +418,15 @@ class OpenSimMarketplace {
             case 'osmp_prim_uuid':
                 $uuid = get_post_meta($post_id, '_prim_uuid', true);
                 echo '<code>' . esc_html($uuid) . '</code>';
+                break;
+            case 'osmp_region':
+                $uuid = get_post_meta($post_id, '_region_uuid', true);
+                $label = get_post_meta($post_id, '_region_label', true);
+                if ($label === '') {
+                    $label = $this->get_region_label((string) $uuid);
+                }
+                $display = $label !== '' ? $label : $uuid;
+                echo esc_html((string) $display);
                 break;
         }
     }
@@ -539,8 +573,8 @@ class OpenSimMarketplace {
                 <input type="text" name="q" value="<?php echo esc_attr($q); ?>" placeholder="Search name...">
                 <select name="region">
                     <option value="">All regions</option>
-                    <?php foreach ($regions as $r): ?>
-                        <option value="<?php echo esc_attr($r); ?>" <?php selected($region, $r); ?>><?php echo esc_html($r); ?></option>
+                    <?php foreach ($regions as $region_uuid => $region_label): ?>
+                        <option value="<?php echo esc_attr($region_uuid); ?>" <?php selected($region, $region_uuid); ?>><?php echo esc_html($region_label); ?></option>
                     <?php endforeach; ?>
                 </select>
                 <input type="number" step="0.01" min="0" name="minp" value="<?php echo ($minp !== null) ? esc_attr($minp) : ''; ?>" placeholder="Min price">
@@ -553,13 +587,18 @@ class OpenSimMarketplace {
                 <?php if (empty($items)): ?>
                     <p class="osmp-muted">No items found.</p>
                 <?php else: ?>
-                    <?php foreach ($items as $post): 
+                    <?php foreach ($items as $post):
                         $item_id     = $post->ID;
                         $title       = get_the_title($item_id);
                         $price       = (float) get_post_meta($item_id, '_price', true);
                         $seller_uuid = get_post_meta($item_id, '_seller_uuid', true);
                         $seller_name = ($seller_uuid && $this->is_valid_uuid($seller_uuid)) ? ($this->get_avatar_name($seller_uuid) ?: null) : null;
                         $seller_label = $seller_name ?: 'Marketplace';
+                        $region_uuid = get_post_meta($item_id, '_region_uuid', true);
+                        $region_label = get_post_meta($item_id, '_region_label', true);
+                        if ($region_label === '') {
+                            $region_label = $this->get_region_label((string) $region_uuid);
+                        }
                         $thumb       = get_the_post_thumbnail($item_id, 'medium', ['loading' => 'lazy', 'alt' => esc_attr($title)]);
                     ?>
                         <div class="osmp-card" data-item-id="<?php echo esc_attr($item_id); ?>">
@@ -568,6 +607,7 @@ class OpenSimMarketplace {
                             <div class="osmp-meta">
                                 <span class="osmp-price"><?php echo esc_html(number_format($price, 2)); ?></span>
                                 <span class="osmp-seller" title="Seller"><?php echo esc_html($seller_label); ?></span>
+                                <span class="osmp-region" title="Region"><?php echo esc_html($region_label !== '' ? $region_label : ($region_uuid ?: '')); ?></span>
                             </div>
                             <div class="osmp-actions">
                                 <?php if (!is_user_logged_in()): ?>
@@ -813,16 +853,39 @@ class OpenSimMarketplace {
 
     private function get_all_regions(): array {
         global $wpdb;
-        $key = '_region_uuid';
+
+        $regions = [];
+        foreach ($this->region_uuids as $uuid) {
+            $regions[$uuid] = $this->get_region_label($uuid);
+        }
+
         $sql = $wpdb->prepare(
-            "SELECT DISTINCT pm.meta_value FROM {$wpdb->postmeta} pm
-             INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
-             WHERE pm.meta_key = %s AND p.post_type = 'opensim_item' AND p.post_status = 'publish'
-             ORDER BY pm.meta_value ASC",
-            $key
+            "SELECT DISTINCT uuid_meta.meta_value AS region_uuid,
+                    COALESCE(label_meta.meta_value, uuid_meta.meta_value) AS region_label
+             FROM {$wpdb->postmeta} uuid_meta
+             INNER JOIN {$wpdb->posts} p ON p.ID = uuid_meta.post_id
+             LEFT JOIN {$wpdb->postmeta} label_meta ON label_meta.post_id = uuid_meta.post_id AND label_meta.meta_key = %s
+             WHERE uuid_meta.meta_key = %s AND p.post_type = 'opensim_item' AND p.post_status = 'publish'",
+            '_region_label',
+            '_region_uuid'
         );
-        $vals = $wpdb->get_col($sql);
-        return array_filter(array_map('strval', (array)$vals));
+
+        $rows = $wpdb->get_results($sql, ARRAY_A);
+        if (is_array($rows)) {
+            foreach ($rows as $row) {
+                $uuid = isset($row['region_uuid']) ? (string) $row['region_uuid'] : '';
+                if ($uuid === '') {
+                    continue;
+                }
+                $label = isset($row['region_label']) ? (string) $row['region_label'] : $uuid;
+                if (!isset($regions[$uuid])) {
+                    $regions[$uuid] = $label !== '' ? $label : $uuid;
+                }
+            }
+        }
+
+        asort($regions, SORT_NATURAL | SORT_FLAG_CASE);
+        return $regions;
     }
 
     // ---- Admin ----
@@ -834,10 +897,38 @@ class OpenSimMarketplace {
     public function admin_page(): void {
         if (!current_user_can('manage_options')) wp_die(__('You do not have sufficient permissions to access this page.'));
 
+        $selected_sync_regions = [];
+        if (isset($_POST['osmp_sync_regions']) && is_array($_POST['osmp_sync_regions'])) {
+            foreach ($_POST['osmp_sync_regions'] as $candidate) {
+                $candidate = trim(sanitize_text_field((string) $candidate));
+                if ($candidate !== '') {
+                    $selected_sync_regions[] = $candidate;
+                }
+            }
+        }
+
         // Manual sync trigger
         if (isset($_POST['osmp_sync_now']) && check_admin_referer('osmp_sync_now', '_wpnonce_osmp_sync')) {
-            $this->sync_prims(200);
-            echo '<div class="notice notice-success"><p>Sync started. Check debug.log for details.</p></div>';
+            $regions_to_sync = [];
+            foreach ($selected_sync_regions as $candidate) {
+                if ($this->is_valid_uuid($candidate)) {
+                    $regions_to_sync[] = $candidate;
+                }
+            }
+
+            $this->sync_prims(200, !empty($regions_to_sync) ? $regions_to_sync : null);
+
+            if (!empty($regions_to_sync)) {
+                $labels = [];
+                foreach ($regions_to_sync as $uuid) {
+                    $label = $this->get_region_label($uuid);
+                    $labels[] = $label !== '' ? $label : $uuid;
+                }
+                $human_list = implode(', ', array_map('esc_html', $labels));
+                echo '<div class="notice notice-success"><p>Sync started for regions: ' . $human_list . '. Check debug.log for details.</p></div>';
+            } else {
+                echo '<div class="notice notice-success"><p>Sync started for all configured regions. Check debug.log for details.</p></div>';
+            }
         }
 
         echo '<div class="wrap"><h1>OpenSim Marketplace Admin</h1>';
@@ -845,8 +936,32 @@ class OpenSimMarketplace {
         $tab = isset($_GET['tab']) ? sanitize_key($_GET['tab']) : 'ignore';
         $allowed_tabs = ['ignore', 'orders', 'logs'];
 
+        $region_options = [];
+        foreach ($this->region_uuids as $uuid) {
+            $region_options[$uuid] = $this->get_region_label($uuid);
+        }
+        if (empty($region_options)) {
+            $region_options = $this->get_all_regions();
+        }
+
         echo '<p><form method="post" style="display:inline-block;margin-right:10px">';
         wp_nonce_field('osmp_sync_now', '_wpnonce_osmp_sync');
+
+        if (!empty($region_options)) {
+            echo '<fieldset style="margin-bottom:8px;border:1px solid #ccd0d4;padding:8px 12px;background:#fff;">';
+            echo '<legend style="font-weight:600;">Regions to sync (optional)</legend>';
+            foreach ($region_options as $uuid => $label) {
+                $uuid = (string) $uuid;
+                $label = (string) $label;
+                $checked = in_array($uuid, $selected_sync_regions, true) ? ' checked' : '';
+                echo '<label style="display:inline-block;margin-right:12px;margin-bottom:4px;">';
+                echo '<input type="checkbox" name="osmp_sync_regions[]" value="' . esc_attr($uuid) . '"' . $checked . '> ' . esc_html($label !== '' ? $label : $uuid);
+                echo '</label>';
+            }
+            echo '<p class="description" style="margin:4px 0 0;">Leave all unchecked to sync every configured region.</p>';
+            echo '</fieldset>';
+        }
+
         echo '<input type="submit" class="button" name="osmp_sync_now" value="Sync Now">';
         echo '</form></p>';
 
@@ -928,7 +1043,7 @@ class OpenSimMarketplace {
                         <th><label for="osmp_region_uuids">Region UUIDs</label></th>
                         <td>
                             <textarea id="osmp_region_uuids" name="osmp_region_uuids" rows="4" class="large-text code" placeholder="e.g. c6baa58b-59a4-4a02-9907-6baaf6cfead7&#10;another-region-uuid"><?php echo esc_textarea((string) get_option('osmp_region_uuids', get_option('osmp_region_uuid', ''))); ?></textarea>
-                            <p class="description">Provide one region UUID per line to import prims from multiple store regions. Legacy single-region setups can leave this with a single UUID.</p>
+                            <p class="description">Provide one region UUID per line. Optionally append a friendly name after a pipe (<code>|</code>) to label the region in the marketplace (e.g. <code>uuid|Main Store</code>). Legacy single-region setups can leave this with a single UUID.</p>
                         </td>
                     </tr>
                     <tr>
@@ -1409,12 +1524,34 @@ class OpenSimMarketplace {
     }
 
     // ---- Cron Import ----
-    public function sync_prims(int $batch_size = 500): void {
+    public function sync_prims(int $batch_size = 500, ?array $target_regions = null): void {
         if (!$this->os_db) {
             error_log('OpenSim Marketplace: OS database not connected for sync_prims');
             return;
         }
-        if (empty($this->region_uuids)) {
+
+        $regions = $this->region_uuids;
+        if (is_array($target_regions)) {
+            $regions = [];
+            foreach ($target_regions as $candidate) {
+                $candidate = trim((string) $candidate);
+                if ($candidate === '' || !$this->is_valid_uuid($candidate)) {
+                    continue;
+                }
+
+                foreach ($this->region_uuids as $configured) {
+                    if (strcasecmp($configured, $candidate) === 0) {
+                        $regions[] = $configured;
+                        continue 2;
+                    }
+                }
+
+                $regions[] = $candidate;
+            }
+        }
+
+        $regions = array_values(array_unique($regions));
+        if (empty($regions)) {
             error_log('OpenSim Marketplace: No region UUIDs configured, sync aborted');
             return;
         }
@@ -1425,20 +1562,24 @@ class OpenSimMarketplace {
         $name_exact    = $sets['name_exact'] ?? [];
         $name_contains = $sets['name_contains'] ?? [];
 
-        $offsets = get_option('osmp_region_offsets', []);
-        if (!is_array($offsets)) {
-            $offsets = [];
+        $offsets_option = get_option('osmp_region_offsets', []);
+        $offsets = [];
+        if (is_array($offsets_option)) {
+            foreach ($offsets_option as $key => $value) {
+                $offsets[strtolower((string) $key)] = max(0, (int) $value);
+            }
         }
 
         $should_reschedule = false;
 
-        foreach ($this->region_uuids as $region_uuid) {
+        foreach ($regions as $region_uuid) {
             if (!$this->is_valid_uuid($region_uuid)) {
                 error_log('OpenSim Marketplace: Skipping invalid region UUID during sync: ' . $region_uuid);
                 continue;
             }
 
-            $last_offset = isset($offsets[$region_uuid]) ? max(0, (int) $offsets[$region_uuid]) : 0;
+            $offset_key  = strtolower($region_uuid);
+            $last_offset = $offsets[$offset_key] ?? 0;
             $limit_clause = sprintf('LIMIT %d, %d', $last_offset, max(1, (int) $batch_size));
 
             try {
@@ -1490,6 +1631,8 @@ class OpenSimMarketplace {
                         'post_status'    => 'any',
                     ]);
 
+                    $region_label = $this->get_region_label($region_uuid);
+
                     if (empty($existing)) {
                         $post_id = wp_insert_post([
                             'post_type'   => 'opensim_item',
@@ -1500,6 +1643,7 @@ class OpenSimMarketplace {
                         if ($post_id && !is_wp_error($post_id)) {
                             update_post_meta($post_id, '_prim_uuid', $prim['UUID']);
                             update_post_meta($post_id, '_region_uuid', $region_uuid);
+                            update_post_meta($post_id, '_region_label', $region_label);
                             update_post_meta($post_id, '_price', 100); // editable in post screen
                             update_post_meta($post_id, '_seller_uuid', '');
                             update_post_meta($post_id, '_forsale', 1);
@@ -1508,6 +1652,7 @@ class OpenSimMarketplace {
                         $post_id = $existing[0]->ID ?? null;
                         if ($post_id) {
                             update_post_meta($post_id, '_region_uuid', $region_uuid);
+                            update_post_meta($post_id, '_region_label', $region_label);
                         }
                     }
 
@@ -1517,9 +1662,9 @@ class OpenSimMarketplace {
                 $stmt->close();
 
                 if ($count < $batch_size) {
-                    $offsets[$region_uuid] = 0;
+                    $offsets[$offset_key] = 0;
                 } else {
-                    $offsets[$region_uuid] = $last_offset + $batch_size;
+                    $offsets[$offset_key] = $last_offset + $batch_size;
                     $should_reschedule = true;
                 }
 
@@ -1890,14 +2035,16 @@ class OpenSimMarketplace {
 
         $where_clause = 'WHERE ' . implode(' AND ', $where_conditions);
 
-        $query = "SELECT p.ID, p.post_title, 
+        $query = "SELECT p.ID, p.post_title,
                          pm1.meta_value AS prim_uuid,
                          pm2.meta_value AS region_uuid,
+                         COALESCE(pm4.meta_value, pm2.meta_value) AS region_label,
                          pm3.meta_value AS price
                   FROM {$wpdb->prefix}posts p
                   JOIN {$wpdb->prefix}postmeta pm1 ON p.ID = pm1.post_id AND pm1.meta_key = '_prim_uuid'
                   LEFT JOIN {$wpdb->prefix}postmeta pm2 ON p.ID = pm2.post_id AND pm2.meta_key = '_region_uuid'
                   LEFT JOIN {$wpdb->prefix}postmeta pm3 ON p.ID = pm3.post_id AND pm3.meta_key = '_price'
+                  LEFT JOIN {$wpdb->prefix}postmeta pm4 ON p.ID = pm4.post_id AND pm4.meta_key = '_region_label'
                   $where_clause
                   ORDER BY p.post_title ASC
                   LIMIT %d OFFSET %d";
@@ -1910,7 +2057,7 @@ class OpenSimMarketplace {
 
         // Total count for pagination
         $count_query = str_replace(
-            "SELECT p.ID, p.post_title, pm1.meta_value AS prim_uuid, pm2.meta_value AS region_uuid, pm3.meta_value AS price",
+            "SELECT p.ID, p.post_title, pm1.meta_value AS prim_uuid, pm2.meta_value AS region_uuid, COALESCE(pm4.meta_value, pm2.meta_value) AS region_label, pm3.meta_value AS price",
             "SELECT COUNT(DISTINCT p.ID)",
             $query
         );

@@ -18,7 +18,29 @@ php-app/                     # PHP backend application
   tests/                     # PHPUnit test suite
 migrations/001_init.sql      # MySQL schema and seed scaffold
 README.md                    # This document
+marketplace-for-api.php      # WordPress marketplace plugin variant using the delivery API
 ```
+
+## WordPress Marketplace Plugin (API Delivery)
+
+The `marketplace-for-api.php` plugin replaces the legacy Corrade integration with calls to the new delivery API. Key features include:
+
+- Manual and scheduled prim imports with per-region offsets and ignore rules.
+- Order handling that sends a GET request to the configured delivery endpoint (`oid`, `uid`, `pass`, and optional `region`).
+- Support for multiple store regions: provide a list of region UUIDs in **Settings → OpenSim Marketplace → Region Synchronisation** and the importer will process each region in turn.
+- Friendly region labels: enter entries as `region-uuid|Display Name` (one per line) to show user-friendly names in filters, cards, and admin tables.
+- Manual sync checkboxes let you trigger a sync for selected regions directly from the admin page; leave unchecked to process every configured region.
+
+### Installation
+
+1. Copy `marketplace-for-api.php` to your WordPress `wp-content/plugins/` directory and activate it from the Plugins screen.
+2. Visit **Settings → OpenSim Marketplace** and configure:
+   - Delivery API URL and password (shared secret).
+   - Region UUID list (newline separated, optional `|Friendly Name`).
+   - Database credentials for OpenSim and money servers.
+3. Optionally schedule cron via WordPress or a system cron job to trigger the five-minute import (`wp cron event run osmp_cron_import`).
+
+The storefront shortcode remains `[osmp_market]`; visitors can filter by friendly region names once the configuration is saved.
 
 ## Building & Installing the OpenSim Module
 
