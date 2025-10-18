@@ -558,8 +558,9 @@ class OpenSimMarketplace {
         $nonce    = wp_create_nonce('osmp_purchase');
 
         ob_start();
+        $instance_id = wp_unique_id('osmp-market-');
         ?>
-        <div class="osmp-market osmp-theme-<?php echo esc_attr($theme); ?>">
+        <div id="<?php echo esc_attr($instance_id); ?>" class="osmp-market osmp-theme-<?php echo esc_attr($theme); ?>">
             <div class="osmp-greet">
                 <?php if (is_user_logged_in()): ?>
                     <div class="osmp-greet-name"><strong>Hello,</strong> <?php echo esc_html($user_label ?? ''); ?></div>
@@ -803,7 +804,8 @@ class OpenSimMarketplace {
 
         <script>
         (function() {
-            const root = document.currentScript.closest('.osmp-market');
+            const root = document.getElementById(<?php echo json_encode($instance_id); ?>);
+            if (!root) return;
             const ajaxUrl = <?php echo json_encode($ajax_url); ?>;
             const nonce   = <?php echo json_encode($nonce); ?>;
             const msgEl   = root.querySelector('.osmp-msg');
@@ -1694,6 +1696,9 @@ class OpenSimMarketplace {
 
         $user_id = get_current_user_id();
         $buyer_uuid = get_user_meta($user_id, '_w4os_avatar_uuid', true);
+        if (empty($buyer_uuid)) {
+            $buyer_uuid = get_user_meta($user_id, 'w4os_uuid', true);
+        }
         if (empty($buyer_uuid) || !$this->is_valid_uuid($buyer_uuid)) { wp_send_json_error('Invalid buyer UUID'); }
 
         $item_id = isset($_POST['item_id']) ? intval($_POST['item_id']) : 0;
@@ -1889,9 +1894,18 @@ class OpenSimMarketplace {
         }
 
         $users = get_users([
-            'meta_key'   => '_w4os_avatar_uuid',
-            'meta_value' => $avatar_uuid,
-            'number'     => 1,
+            'meta_query' => [
+                'relation' => 'OR',
+                [
+                    'key'   => '_w4os_avatar_uuid',
+                    'value' => $avatar_uuid,
+                ],
+                [
+                    'key'   => 'w4os_uuid',
+                    'value' => $avatar_uuid,
+                ],
+            ],
+            'number' => 1,
         ]);
 
         if (!empty($users)) {
