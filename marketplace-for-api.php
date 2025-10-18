@@ -473,6 +473,54 @@ class OpenSimMarketplace {
         }
     }
 
+    private function get_avatar_meta_keys(): array {
+        $default_keys = [
+            '_w4os_avatar_uuid',
+            'w4os_uuid',
+            'w4os_avatar_uuid',
+            'avatar_uuid',
+            'opensim_avatar_uuid',
+            'os_avatar_uuid',
+            '_os_avatar_uuid',
+        ];
+
+        $filtered_keys = apply_filters('osmp_avatar_uuid_meta_keys', $default_keys, $this);
+        if (!is_array($filtered_keys)) {
+            $filtered_keys = $default_keys;
+        }
+
+        $unique_keys = [];
+        foreach ($filtered_keys as $key) {
+            $key = trim((string) $key);
+            if ($key !== '') {
+                $unique_keys[$key] = true;
+            }
+        }
+
+        return array_keys($unique_keys);
+    }
+
+    private function get_user_avatar_uuid(int $user_id): string {
+        if ($user_id <= 0) {
+            return '';
+        }
+
+        $meta_keys = $this->get_avatar_meta_keys();
+        foreach ($meta_keys as $meta_key) {
+            $value = (string) get_user_meta($user_id, $meta_key, true);
+            if ($value !== '' && $this->is_valid_uuid($value)) {
+                return $value;
+            }
+        }
+
+        $fallback = apply_filters('osmp_avatar_uuid_fallback', '', $user_id, $meta_keys, $this);
+        if (is_string($fallback) && $fallback !== '' && $this->is_valid_uuid($fallback)) {
+            return $fallback;
+        }
+
+        return '';
+    }
+
     private function get_avatar_name(string $uuid): ?string {
         if (!$this->os_db || !$this->is_valid_uuid($uuid)) return null;
         $cache_key = 'osmp_name_' . $uuid;
@@ -521,7 +569,7 @@ class OpenSimMarketplace {
         if (is_user_logged_in()) {
             $user   = wp_get_current_user();
             $wpname = $user && $user->display_name ? $user->display_name : ($user ? $user->user_login : '');
-            $uuid   = get_user_meta($user->ID, 'w4os_uuid', true);
+            $uuid   = $this->get_user_avatar_uuid((int) $user->ID);
             $avname = ($uuid && $this->is_valid_uuid($uuid)) ? $this->get_avatar_name($uuid) : null;
             $user_label = $avname ? ($wpname . ' (' . $avname . ')') : $wpname;
             if ($uuid) $balance = $this->get_user_balance($uuid);
@@ -558,8 +606,9 @@ class OpenSimMarketplace {
         $nonce    = wp_create_nonce('osmp_purchase');
 
         ob_start();
+        $instance_id = wp_unique_id('osmp-market-');
         ?>
-        <div class="osmp-market osmp-theme-<?php echo esc_attr($theme); ?>">
+        <div id="<?php echo esc_attr($instance_id); ?>" class="osmp-market osmp-theme-<?php echo esc_attr($theme); ?>">
             <div class="osmp-greet">
                 <?php if (is_user_logged_in()): ?>
                     <div class="osmp-greet-name"><strong>Hello,</strong> <?php echo esc_html($user_label ?? ''); ?></div>
@@ -803,7 +852,8 @@ class OpenSimMarketplace {
 
         <script>
         (function() {
-            const root = document.currentScript.closest('.osmp-market');
+            const root = document.getElementById(<?php echo json_encode($instance_id); ?>);
+            if (!root) return;
             const ajaxUrl = <?php echo json_encode($ajax_url); ?>;
             const nonce   = <?php echo json_encode($nonce); ?>;
             const msgEl   = root.querySelector('.osmp-msg');
@@ -831,13 +881,33 @@ class OpenSimMarketplace {
                     form.append('_wpnonce', nonce);
 
                     const resp = await fetch(ajaxUrl, { method: 'POST', body: form, credentials: 'same-origin' });
-                    const data = await resp.json();
+                    const text = await resp.text();
+                    let data = null;
 
-                    if (data && data.success) {
-                        setMsg((data.data?.message || 'Purchase successful') + ' (Order #' + (data.data?.order_id || '?') + ')', true);
+                    if (text) {
+                        try {
+                            data = JSON.parse(text);
+                        } catch (parseError) {
+                            const trimmed = text.trim();
+                            if (trimmed !== '') {
+                                setMsg(trimmed, resp.ok);
+                            } else {
+                                setMsg(resp.ok ? 'Empty response from server' : 'Purchase failed (HTTP ' + resp.status + ')', false);
+                            }
+                            return;
+                        }
+                    }
+
+                    if (data && typeof data === 'object' && 'success' in data) {
+                        if (data.success) {
+                            setMsg((data.data?.message || 'Purchase successful') + ' (Order #' + (data.data?.order_id || '?') + ')', true);
+                        } else {
+                            const err = data.data || data.message || 'Purchase failed';
+                            setMsg(typeof err === 'string' ? err : 'Purchase failed', false);
+                        }
                     } else {
-                        const err = data && data.data ? data.data : (data && data.message ? data.message : 'Purchase failed');
-                        setMsg(err, false);
+                        const fallback = text && text.trim() !== '' ? text.trim() : 'Unexpected response from server';
+                        setMsg(fallback, resp.ok);
                     }
                 } catch (err) {
                     setMsg('Network or server error during purchase', false);
@@ -1693,7 +1763,7 @@ class OpenSimMarketplace {
         if (!$this->money_db) { wp_send_json_error('Service temporarily unavailable'); }
 
         $user_id = get_current_user_id();
-        $buyer_uuid = get_user_meta($user_id, '_w4os_avatar_uuid', true);
+        $buyer_uuid = $this->get_user_avatar_uuid($user_id);
         if (empty($buyer_uuid) || !$this->is_valid_uuid($buyer_uuid)) { wp_send_json_error('Invalid buyer UUID'); }
 
         $item_id = isset($_POST['item_id']) ? intval($_POST['item_id']) : 0;
@@ -1888,9 +1958,28 @@ class OpenSimMarketplace {
             return $avatar_uuid;
         }
 
+        $meta_keys  = $this->get_avatar_meta_keys();
+        $meta_query = ['relation' => 'OR'];
+        foreach ($meta_keys as $meta_key) {
+            $meta_query[] = [
+                'key'     => $meta_key,
+                'value'   => $avatar_uuid,
+                'compare' => '=',
+            ];
+        }
+
+        if (count($meta_query) === 1) {
+            $meta_query[] = [
+                'key'     => '_w4os_avatar_uuid',
+                'value'   => $avatar_uuid,
+                'compare' => '=',
+            ];
+        }
+
+        $meta_query = apply_filters('osmp_avatar_display_meta_query', $meta_query, $avatar_uuid, $this);
+
         $users = get_users([
-            'meta_key'   => '_w4os_avatar_uuid',
-            'meta_value' => $avatar_uuid,
+            'meta_query' => $meta_query,
             'number'     => 1,
         ]);
 
