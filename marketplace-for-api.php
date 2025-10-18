@@ -26,6 +26,7 @@ class OpenSimMarketplace {
     private string $delivery_api_password = '';
     private array $region_uuids = [];
     private array $region_labels = [];
+    private array $region_delivery_urls = [];
     private string $region_uuid = '';
     private array $ignore_list = [];
     private string $plugin_version = '2.0';
@@ -92,6 +93,7 @@ class OpenSimMarketplace {
         $this->delivery_api_password = $this->decrypt_option('osmp_delivery_api_password', '');
 
         $this->region_labels = [];
+        $this->region_delivery_urls = [];
         $raw_regions = get_option('osmp_region_uuids', '');
         if (is_array($raw_regions)) {
             $raw_list = $raw_regions;
@@ -106,17 +108,23 @@ class OpenSimMarketplace {
                 continue;
             }
 
-            $uuid_part  = $value;
-            $label_part = '';
-            if (strpos($value, '|') !== false) {
-                [$uuid_part, $label_part] = array_map('trim', explode('|', $value, 2));
-            }
+            $parts = array_map('trim', explode('|', $value));
+            $uuid_part  = $parts[0] ?? '';
+            $label_part = $parts[1] ?? '';
+            $api_part   = $parts[2] ?? '';
 
             if ($this->is_valid_uuid($uuid_part)) {
                 $normalized = strtolower($uuid_part);
                 if (!isset($this->region_labels[$normalized])) {
                     $valid_regions[] = $uuid_part;
                     $this->region_labels[$normalized] = $label_part !== '' ? $label_part : $uuid_part;
+                }
+
+                if ($api_part !== '') {
+                    $api_url = rtrim((string) $api_part, "/\t\n\r ");
+                    if ($api_url !== '' && filter_var($api_url, FILTER_VALIDATE_URL)) {
+                        $this->region_delivery_urls[$normalized] = $api_url;
+                    }
                 }
             }
         }
@@ -136,6 +144,25 @@ class OpenSimMarketplace {
         }
 
         $this->ignore_list = get_option('osmp_ignore_list', []); // legacy option only
+    }
+
+    private function get_region_delivery_api_url(?string $region_uuid): string {
+        $base = $this->delivery_api_url;
+
+        if ($region_uuid) {
+            $normalized = strtolower(trim($region_uuid));
+            if ($normalized !== '' && isset($this->region_delivery_urls[$normalized]) && $this->region_delivery_urls[$normalized] !== '') {
+                $base = $this->region_delivery_urls[$normalized];
+            }
+        }
+
+        /**
+         * Filters the delivery API base URL before a delivery request is dispatched.
+         *
+         * @param string      $base_url    The resolved base URL.
+         * @param string|null $region_uuid The region UUID associated with the order (if any).
+         */
+        return (string) apply_filters('osmp_delivery_api_base_url', $base, $region_uuid);
     }
 
     private function init_database_connections(): void {
@@ -1112,8 +1139,8 @@ class OpenSimMarketplace {
                     <tr>
                         <th><label for="osmp_region_uuids">Region UUIDs</label></th>
                         <td>
-                            <textarea id="osmp_region_uuids" name="osmp_region_uuids" rows="4" class="large-text code" placeholder="e.g. c6baa58b-59a4-4a02-9907-6baaf6cfead7&#10;another-region-uuid"><?php echo esc_textarea((string) get_option('osmp_region_uuids', get_option('osmp_region_uuid', ''))); ?></textarea>
-                            <p class="description">Provide one region UUID per line. Optionally append a friendly name after a pipe (<code>|</code>) to label the region in the marketplace (e.g. <code>uuid|Main Store</code>). Legacy single-region setups can leave this with a single UUID.</p>
+                            <textarea id="osmp_region_uuids" name="osmp_region_uuids" rows="4" class="large-text code" placeholder="e.g. c6baa58b-59a4-4a02-9907-6baaf6cfead7&#10;another-region-uuid|Main Store&#10;third-region-uuid|Outlet|https://grid.example/send"><?php echo esc_textarea((string) get_option('osmp_region_uuids', get_option('osmp_region_uuid', ''))); ?></textarea>
+                            <p class="description">Provide one region UUID per line. Optionally append a friendly name after a pipe (<code>|</code>) to label the region in the marketplace (e.g. <code>uuid|Main Store</code>). Add a second pipe followed by a delivery API base URL to override the global endpoint for that region (e.g. <code>uuid||https://grid.example/send</code>).</p>
                         </td>
                     </tr>
                     <tr>
@@ -1852,7 +1879,8 @@ class OpenSimMarketplace {
             if (!$this->is_valid_uuid($buyer_uuid)) {
                 throw new Exception('Invalid buyer UUID for delivery');
             }
-            if ($this->delivery_api_url === '') {
+            $delivery_api_base = $this->get_region_delivery_api_url($region_uuid);
+            if ($delivery_api_base === '') {
                 throw new Exception('Delivery API URL is not configured');
             }
 
@@ -1871,7 +1899,7 @@ class OpenSimMarketplace {
                 $query['region'] = $region_uuid;
             }
 
-            $request_url = add_query_arg(array_map(static fn($value) => is_scalar($value) ? (string) $value : '', $query), $this->delivery_api_url);
+            $request_url = add_query_arg(array_map(static fn($value) => is_scalar($value) ? (string) $value : '', $query), $delivery_api_base);
 
             $response = wp_remote_get($request_url, [
                 'timeout' => 30,
