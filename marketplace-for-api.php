@@ -176,6 +176,25 @@ class OpenSimMarketplace {
         return (string) apply_filters('osmp_delivery_api_base_url', $base, $region_uuid);
     }
 
+    private function get_region_delivery_api_url(?string $region_uuid): string {
+        $base = $this->delivery_api_url;
+
+        if ($region_uuid) {
+            $normalized = strtolower(trim($region_uuid));
+            if ($normalized !== '' && isset($this->region_delivery_urls[$normalized]) && $this->region_delivery_urls[$normalized] !== '') {
+                $base = $this->region_delivery_urls[$normalized];
+            }
+        }
+
+        /**
+         * Filters the delivery API base URL before a delivery request is dispatched.
+         *
+         * @param string      $base_url    The resolved base URL.
+         * @param string|null $region_uuid The region UUID associated with the order (if any).
+         */
+        return (string) apply_filters('osmp_delivery_api_base_url', $base, $region_uuid);
+    }
+
     private function init_database_connections(): void {
         try {
             $os_host = get_option('osmp_os_db_host', 'i.let-us.cyou');
