@@ -26,16 +26,26 @@ class OpenSimMarketplace {
     private string $delivery_api_password = '';
     private array $region_uuids = [];
     private array $region_labels = [];
+    private array $region_delivery_urls = [];
     private string $region_uuid = '';
     private array $ignore_list = [];
     private string $plugin_version = '2.0';
+    private ?array $avatar_session = null;
+    private ?array $cached_buyer_context = null;
+    private string $avatar_cookie_name = 'osmp_avatar_session';
+    private int $avatar_cookie_lifetime = 604800; // 7 days
+    private string $texture_proxy_template = '';
 
     public function __construct() {
         add_action('init', [$this, 'register_cpt']);
         add_action('init', [$this, 'register_shortcodes']);
         add_action('admin_menu', [$this, 'admin_menu']);
         add_action('wp_ajax_osmp_purchase', [$this, 'handle_purchase']);
-        add_action('wp_ajax_nopriv_osmp_purchase', function () { wp_send_json_error('Authentication required'); });
+        add_action('wp_ajax_nopriv_osmp_purchase', [$this, 'handle_purchase']);
+        add_action('wp_ajax_osmp_avatar_login', [$this, 'handle_avatar_login']);
+        add_action('wp_ajax_nopriv_osmp_avatar_login', [$this, 'handle_avatar_login']);
+        add_action('wp_ajax_osmp_avatar_logout', [$this, 'handle_avatar_logout']);
+        add_action('wp_ajax_nopriv_osmp_avatar_logout', [$this, 'handle_avatar_logout']);
         add_action('osmp_cron_import', [$this, 'sync_prims']);
         add_action('rest_api_init', [$this, 'register_rest_api']);
 
@@ -57,6 +67,7 @@ class OpenSimMarketplace {
         add_action('plugins_loaded', function () {
             $this->init_config();
             $this->init_database_connections();
+            $this->load_avatar_session();
         });
     }
 
@@ -92,6 +103,7 @@ class OpenSimMarketplace {
         $this->delivery_api_password = $this->decrypt_option('osmp_delivery_api_password', '');
 
         $this->region_labels = [];
+        $this->region_delivery_urls = [];
         $raw_regions = get_option('osmp_region_uuids', '');
         if (is_array($raw_regions)) {
             $raw_list = $raw_regions;
@@ -106,17 +118,23 @@ class OpenSimMarketplace {
                 continue;
             }
 
-            $uuid_part  = $value;
-            $label_part = '';
-            if (strpos($value, '|') !== false) {
-                [$uuid_part, $label_part] = array_map('trim', explode('|', $value, 2));
-            }
+            $parts = array_map('trim', explode('|', $value));
+            $uuid_part  = $parts[0] ?? '';
+            $label_part = $parts[1] ?? '';
+            $api_part   = $parts[2] ?? '';
 
             if ($this->is_valid_uuid($uuid_part)) {
                 $normalized = strtolower($uuid_part);
                 if (!isset($this->region_labels[$normalized])) {
                     $valid_regions[] = $uuid_part;
                     $this->region_labels[$normalized] = $label_part !== '' ? $label_part : $uuid_part;
+                }
+
+                if ($api_part !== '') {
+                    $api_url = rtrim((string) $api_part, "/\t\n\r ");
+                    if ($api_url !== '' && filter_var($api_url, FILTER_VALIDATE_URL)) {
+                        $this->region_delivery_urls[$normalized] = $api_url;
+                    }
                 }
             }
         }
@@ -136,6 +154,26 @@ class OpenSimMarketplace {
         }
 
         $this->ignore_list = get_option('osmp_ignore_list', []); // legacy option only
+        $this->texture_proxy_template = trim((string) get_option('osmp_texture_proxy_template', ''));
+    }
+
+    private function get_region_delivery_api_url(?string $region_uuid): string {
+        $base = $this->delivery_api_url;
+
+        if ($region_uuid) {
+            $normalized = strtolower(trim($region_uuid));
+            if ($normalized !== '' && isset($this->region_delivery_urls[$normalized]) && $this->region_delivery_urls[$normalized] !== '') {
+                $base = $this->region_delivery_urls[$normalized];
+            }
+        }
+
+        /**
+         * Filters the delivery API base URL before a delivery request is dispatched.
+         *
+         * @param string      $base_url    The resolved base URL.
+         * @param string|null $region_uuid The region UUID associated with the order (if any).
+         */
+        return (string) apply_filters('osmp_delivery_api_base_url', $base, $region_uuid);
     }
 
     private function init_database_connections(): void {
@@ -167,6 +205,173 @@ class OpenSimMarketplace {
         } catch (Throwable $e) {
             error_log("Database connection error: " . $e->getMessage());
         }
+    }
+
+    private function load_avatar_session(): void {
+        $this->avatar_session = null;
+        $this->cached_buyer_context = null;
+
+        if (empty($_COOKIE[$this->avatar_cookie_name])) {
+            return;
+        }
+
+        $raw = (string) $_COOKIE[$this->avatar_cookie_name];
+        $parts = explode('|', $raw);
+        if (count($parts) !== 3) {
+            $this->clear_avatar_session();
+            return;
+        }
+
+        [$uuid, $expires, $signature] = $parts;
+        $uuid = trim((string) $uuid);
+        $expires = (int) $expires;
+        $signature = trim((string) $signature);
+
+        if (!$this->is_valid_uuid($uuid) || $expires <= time()) {
+            $this->clear_avatar_session();
+            return;
+        }
+
+        $expected = $this->build_avatar_cookie_signature($uuid, $expires);
+        if (!hash_equals($expected, $signature)) {
+            $this->clear_avatar_session();
+            return;
+        }
+
+        $this->avatar_session = [
+            'uuid'    => $uuid,
+            'expires' => $expires,
+        ];
+    }
+
+    private function build_avatar_cookie_signature(string $uuid, int $expires): string {
+        $key = function_exists('wp_salt') ? wp_salt('auth') : $this->get_crypto_key();
+        return hash_hmac('sha256', $uuid . '|' . $expires, $key);
+    }
+
+    private function write_avatar_cookie(string $value, int $expires): void {
+        $args = [
+            'expires'  => $expires,
+            'path'     => defined('COOKIEPATH') ? (string) COOKIEPATH : '/',
+            'secure'   => is_ssl(),
+            'httponly' => true,
+            'samesite' => 'Lax',
+        ];
+
+        if (defined('COOKIE_DOMAIN') && COOKIE_DOMAIN !== '') {
+            $args['domain'] = COOKIE_DOMAIN;
+        }
+
+        setcookie($this->avatar_cookie_name, $value, $args);
+
+        if (defined('SITECOOKIEPATH') && SITECOOKIEPATH !== $args['path']) {
+            $args['path'] = SITECOOKIEPATH;
+            setcookie($this->avatar_cookie_name, $value, $args);
+        }
+    }
+
+    private function issue_avatar_session(string $uuid): void {
+        $expires = time() + $this->avatar_cookie_lifetime;
+        $payload = implode('|', [
+            $uuid,
+            (string) $expires,
+            $this->build_avatar_cookie_signature($uuid, $expires),
+        ]);
+
+        $this->write_avatar_cookie($payload, $expires);
+
+        $this->avatar_session = [
+            'uuid'    => $uuid,
+            'expires' => $expires,
+        ];
+        $this->cached_buyer_context = null;
+    }
+
+    private function clear_avatar_session(): void {
+        $this->avatar_session = null;
+        $this->cached_buyer_context = null;
+        $this->write_avatar_cookie('', time() - 3600);
+    }
+
+    private function get_texture_proxy_url(string $uuid): ?string {
+        if (!$this->is_valid_uuid($uuid)) {
+            return null;
+        }
+
+        $template = trim((string) $this->texture_proxy_template);
+        if ($template === '') {
+            return null;
+        }
+
+        if (strpos($template, '{uuid}') !== false) {
+            return str_replace('{uuid}', $uuid, $template);
+        }
+
+        $base = rtrim($template, '/');
+        return $base . '/' . $uuid;
+    }
+
+    private function resolve_buyer_context(bool $with_balance = false): ?array {
+        if ($this->cached_buyer_context === null) {
+            $context = null;
+
+            if (is_user_logged_in()) {
+                $user = wp_get_current_user();
+                if ($user && $user->exists()) {
+                    $uuid = $this->get_user_avatar_uuid((int) $user->ID);
+                    if ($uuid !== '' && $this->is_valid_uuid($uuid)) {
+                        $wp_name = trim((string) $user->display_name);
+                        if ($wp_name === '') {
+                            $wp_name = trim((string) $user->user_login);
+                        }
+
+                        $context = [
+                            'uuid'    => $uuid,
+                            'source'  => 'wp',
+                            'wp_name' => $wp_name,
+                        ];
+                    }
+                }
+            }
+
+            if ((!$context || empty($context['uuid'])) && $this->avatar_session) {
+                $uuid = $this->avatar_session['uuid'] ?? '';
+                if ($this->is_valid_uuid($uuid)) {
+                    $context = [
+                        'uuid'   => $uuid,
+                        'source' => 'avatar',
+                    ];
+                }
+            }
+
+            if ($context) {
+                $avatar_name = $this->get_avatar_name($context['uuid']);
+                $context['avatar_name'] = $avatar_name ?: null;
+
+                if ($context['source'] === 'wp') {
+                    $label = $context['wp_name'] ?? '';
+                    if ($label === '') {
+                        $label = $avatar_name ?: $context['uuid'];
+                    } elseif ($avatar_name) {
+                        $label .= ' (' . $avatar_name . ')';
+                    }
+                    $context['display'] = $label;
+                } else {
+                    $context['display'] = $avatar_name ?: $context['uuid'];
+                }
+            }
+
+            $this->cached_buyer_context = $context;
+        }
+
+        $context = $this->cached_buyer_context;
+
+        if ($with_balance && $context && !array_key_exists('balance', $context)) {
+            $context['balance'] = $this->get_user_balance($context['uuid']);
+            $this->cached_buyer_context = $context;
+        }
+
+        return $context;
     }
 
     private function setup_cron(): void {
@@ -335,6 +540,8 @@ class OpenSimMarketplace {
         $seller_uuid = get_post_meta($post->ID, '_seller_uuid', true);
         $prim_uuid   = get_post_meta($post->ID, '_prim_uuid', true);
         $region_uuid = get_post_meta($post->ID, '_region_uuid', true);
+        $texture_uuid = get_post_meta($post->ID, '_texture_uuid', true);
+        $texture_url  = get_post_meta($post->ID, '_texture_url', true);
 
         $price = is_numeric($price) ? (float)$price : 0.0;
         $forsale = $forsale ? 1 : 0;
@@ -359,6 +566,16 @@ class OpenSimMarketplace {
 
         echo '<tr><th>Region UUID</th><td>';
         echo '<input type="text" readonly value="' . esc_attr($region_uuid) . '" class="regular-text code">';
+        echo '</td></tr>';
+
+        echo '<tr><th><label for="osmp_texture_uuid">Texture UUID</label></th><td>';
+        echo '<input type="text" id="osmp_texture_uuid" name="osmp_texture_uuid" value="' . esc_attr($texture_uuid) . '" class="regular-text" placeholder="Optional texture UUID">';
+        echo '<p class="description">Provide an OpenSim texture UUID to pull previews via the configured proxy.</p>';
+        echo '</td></tr>';
+
+        echo '<tr><th><label for="osmp_texture_url">External Image URL</label></th><td>';
+        echo '<input type="url" id="osmp_texture_url" name="osmp_texture_url" value="' . esc_attr($texture_url) . '" class="regular-text" placeholder="https://example.com/image.jpg">';
+        echo '<p class="description">Used when no featured image or texture UUID is set.</p>';
         echo '</td></tr>';
 
         echo '</table>';
@@ -386,6 +603,25 @@ class OpenSimMarketplace {
             $seller_uuid = trim(sanitize_text_field($_POST['osmp_seller_uuid']));
             if ($seller_uuid === '' || $this->is_valid_uuid($seller_uuid)) {
                 update_post_meta($post_id, '_seller_uuid', $seller_uuid);
+            }
+        }
+
+        if (isset($_POST['osmp_texture_uuid'])) {
+            $texture_uuid = trim(sanitize_text_field($_POST['osmp_texture_uuid']));
+            if ($texture_uuid === '') {
+                delete_post_meta($post_id, '_texture_uuid');
+            } elseif ($this->is_valid_uuid($texture_uuid)) {
+                update_post_meta($post_id, '_texture_uuid', $texture_uuid);
+            }
+        }
+
+        if (isset($_POST['osmp_texture_url'])) {
+            $texture_url = trim((string) $_POST['osmp_texture_url']);
+            $clean_url = esc_url_raw($texture_url);
+            if ($texture_url === '' || $clean_url === '') {
+                delete_post_meta($post_id, '_texture_url');
+            } else {
+                update_post_meta($post_id, '_texture_url', $clean_url);
             }
         }
     }
@@ -473,6 +709,54 @@ class OpenSimMarketplace {
         }
     }
 
+    private function get_avatar_meta_keys(): array {
+        $default_keys = [
+            '_w4os_avatar_uuid',
+            'w4os_uuid',
+            'w4os_avatar_uuid',
+            'avatar_uuid',
+            'opensim_avatar_uuid',
+            'os_avatar_uuid',
+            '_os_avatar_uuid',
+        ];
+
+        $filtered_keys = apply_filters('osmp_avatar_uuid_meta_keys', $default_keys, $this);
+        if (!is_array($filtered_keys)) {
+            $filtered_keys = $default_keys;
+        }
+
+        $unique_keys = [];
+        foreach ($filtered_keys as $key) {
+            $key = trim((string) $key);
+            if ($key !== '') {
+                $unique_keys[$key] = true;
+            }
+        }
+
+        return array_keys($unique_keys);
+    }
+
+    private function get_user_avatar_uuid(int $user_id): string {
+        if ($user_id <= 0) {
+            return '';
+        }
+
+        $meta_keys = $this->get_avatar_meta_keys();
+        foreach ($meta_keys as $meta_key) {
+            $value = (string) get_user_meta($user_id, $meta_key, true);
+            if ($value !== '' && $this->is_valid_uuid($value)) {
+                return $value;
+            }
+        }
+
+        $fallback = apply_filters('osmp_avatar_uuid_fallback', '', $user_id, $meta_keys, $this);
+        if (is_string($fallback) && $fallback !== '' && $this->is_valid_uuid($fallback)) {
+            return $fallback;
+        }
+
+        return '';
+    }
+
     private function get_avatar_name(string $uuid): ?string {
         if (!$this->os_db || !$this->is_valid_uuid($uuid)) return null;
         $cache_key = 'osmp_name_' . $uuid;
@@ -515,17 +799,14 @@ class OpenSimMarketplace {
         $minp     = isset($_GET['minp']) ? floatval($_GET['minp']) : null;
         $maxp     = isset($_GET['maxp']) ? floatval($_GET['maxp']) : null;
 
-        // Current user label (WP display name and optional avatar name) + balance
-        $balance = null; $user_label = null;
+        // Current user/visitor context
         $login_url = wp_login_url(get_permalink());
-        if (is_user_logged_in()) {
-            $user   = wp_get_current_user();
-            $wpname = $user && $user->display_name ? $user->display_name : ($user ? $user->user_login : '');
-            $uuid   = get_user_meta($user->ID, 'w4os_uuid', true);
-            $avname = ($uuid && $this->is_valid_uuid($uuid)) ? $this->get_avatar_name($uuid) : null;
-            $user_label = $avname ? ($wpname . ' (' . $avname . ')') : $wpname;
-            if ($uuid) $balance = $this->get_user_balance($uuid);
-        }
+        $buyer_context = $this->resolve_buyer_context(true);
+        $balance = $buyer_context['balance'] ?? null;
+        $user_label = $buyer_context['display'] ?? null;
+        $buyer_source = $buyer_context['source'] ?? null;
+        $avatar_image_url = $buyer_context ? $this->get_texture_proxy_url($buyer_context['uuid']) : null;
+        $avatar_login_nonce = wp_create_nonce('osmp_avatar_login');
 
         $args = [
             'post_type'      => 'opensim_item',
@@ -558,14 +839,44 @@ class OpenSimMarketplace {
         $nonce    = wp_create_nonce('osmp_purchase');
 
         ob_start();
+        $instance_id = wp_unique_id('osmp-market-');
         ?>
-        <div class="osmp-market osmp-theme-<?php echo esc_attr($theme); ?>">
+        <div id="<?php echo esc_attr($instance_id); ?>" class="osmp-market osmp-theme-<?php echo esc_attr($theme); ?>">
             <div class="osmp-greet">
-                <?php if (is_user_logged_in()): ?>
-                    <div class="osmp-greet-name"><strong>Hello,</strong> <?php echo esc_html($user_label ?? ''); ?></div>
-                    <div class="osmp-greet-balance"><strong>Your balance:</strong> <span><?php echo ($balance !== null) ? esc_html(number_format($balance, 2)) : '—'; ?></span></div>
+                <?php if ($buyer_context): ?>
+                    <div class="osmp-greet-info">
+                        <?php if ($avatar_image_url): ?>
+                            <div class="osmp-greet-avatar">
+                                <img src="<?php echo esc_url($avatar_image_url); ?>" alt="<?php echo esc_attr($user_label ?? 'Avatar'); ?>" loading="lazy">
+                            </div>
+                        <?php endif; ?>
+                        <div class="osmp-greet-text">
+                            <div class="osmp-greet-name"><strong>Hello,</strong> <?php echo esc_html($user_label ?? ''); ?></div>
+                            <div class="osmp-greet-balance"><strong>Your balance:</strong> <span><?php echo ($balance !== null) ? esc_html(number_format((float) $balance, 2)) : '—'; ?></span></div>
+                        </div>
+                    </div>
+                    <div class="osmp-greet-actions">
+                        <?php if ($buyer_source === 'avatar'): ?>
+                            <button type="button" class="osmp-btn osmp-btn-secondary osmp-avatar-logout">Log out</button>
+                        <?php else: ?>
+                            <a class="osmp-btn osmp-btn-secondary" href="<?php echo esc_url(wp_logout_url(get_permalink())); ?>">Log out</a>
+                        <?php endif; ?>
+                    </div>
                 <?php else: ?>
-                    <a href="<?php echo esc_url($login_url); ?>">Log in</a> to see your name, balance, and buy.
+                    <div class="osmp-greet-info osmp-greet-info--stack">
+                        <div class="osmp-greet-name"><strong>Welcome!</strong> Sign in with your WordPress account or avatar UUID to buy.</div>
+                        <div class="osmp-login-options">
+                            <a class="osmp-btn" href="<?php echo esc_url($login_url); ?>">WordPress Login</a>
+                            <form class="osmp-avatar-login" method="post" action="">
+                                <label for="<?php echo esc_attr($instance_id); ?>-avatar-uuid">Avatar UUID</label>
+                                <div class="osmp-avatar-login__row">
+                                    <input type="text" id="<?php echo esc_attr($instance_id); ?>-avatar-uuid" name="avatar_uuid" maxlength="36" pattern="[0-9a-fA-F-]{36}" placeholder="00000000-0000-0000-0000-000000000000" autocomplete="off" inputmode="text" required>
+                                    <button type="submit" class="osmp-btn">Sign in</button>
+                                </div>
+                                <p class="osmp-muted osmp-avatar-login__help">Your avatar UUID is stored securely in a cookie for quick checkout on this browser.</p>
+                            </form>
+                        </div>
+                    </div>
                 <?php endif; ?>
             </div>
 
@@ -599,10 +910,25 @@ class OpenSimMarketplace {
                         if ($region_label === '') {
                             $region_label = $this->get_region_label((string) $region_uuid);
                         }
-                        $thumb       = get_the_post_thumbnail($item_id, 'medium', ['loading' => 'lazy', 'alt' => esc_attr($title)]);
+                        $thumb_html  = get_the_post_thumbnail($item_id, 'medium', ['loading' => 'lazy', 'alt' => esc_attr($title)]);
+                        if (!$thumb_html) {
+                            $texture_uuid_meta = (string) get_post_meta($item_id, '_texture_uuid', true);
+                            if ($texture_uuid_meta !== '' && $this->is_valid_uuid($texture_uuid_meta)) {
+                                $proxy_url = $this->get_texture_proxy_url($texture_uuid_meta);
+                                if ($proxy_url) {
+                                    $thumb_html = sprintf('<img src="%s" alt="%s" loading="lazy" class="osmp-thumb-img" />', esc_url($proxy_url), esc_attr($title));
+                                }
+                            }
+                        }
+                        if (!$thumb_html) {
+                            $texture_url_meta = (string) get_post_meta($item_id, '_texture_url', true);
+                            if ($texture_url_meta !== '') {
+                                $thumb_html = sprintf('<img src="%s" alt="%s" loading="lazy" class="osmp-thumb-img" />', esc_url($texture_url_meta), esc_attr($title));
+                            }
+                        }
                     ?>
                         <div class="osmp-card" data-item-id="<?php echo esc_attr($item_id); ?>">
-                            <div class="osmp-thumb"><?php echo $thumb ?: '<div class="osmp-thumb--ph"></div>'; ?></div>
+                            <div class="osmp-thumb"><?php echo $thumb_html ?: '<div class="osmp-thumb--ph"></div>'; ?></div>
                             <h3 class="osmp-title" title="<?php echo esc_attr($title); ?>"><?php echo esc_html($title); ?></h3>
                             <div class="osmp-meta">
                                 <span class="osmp-price"><?php echo esc_html(number_format($price, 2)); ?></span>
@@ -610,10 +936,10 @@ class OpenSimMarketplace {
                                 <span class="osmp-region" title="Region"><?php echo esc_html($region_label !== '' ? $region_label : ($region_uuid ?: '')); ?></span>
                             </div>
                             <div class="osmp-actions">
-                                <?php if (!is_user_logged_in()): ?>
-                                    <a class="osmp-btn" href="<?php echo esc_url($login_url); ?>">Log in to buy</a>
+                                <?php if (!$buyer_context): ?>
+                                    <button type="button" class="osmp-btn osmp-open-login">Sign in to buy</button>
                                 <?php else: ?>
-                                    <button class="osmp-btn osmp-buy" data-item="<?php echo esc_attr($item_id); ?>">Buy</button>
+                                    <button type="button" class="osmp-btn osmp-buy" data-item="<?php echo esc_attr($item_id); ?>">Buy</button>
                                 <?php endif; ?>
                             </div>
                         </div>
@@ -727,6 +1053,21 @@ class OpenSimMarketplace {
                 box-shadow: var(--shadow);
             }
             .osmp-greet strong { color: var(--text); }
+            .osmp-greet-info { display:flex; align-items:center; gap:1rem; flex:1; }
+            .osmp-greet-info--stack { flex-direction: column; align-items:flex-start; gap:.75rem; }
+            .osmp-greet-avatar { width:64px; height:64px; border-radius:50%; overflow:hidden; border:1px solid var(--border); background: var(--field); flex-shrink:0; }
+            .osmp-greet-avatar img { width:100%; height:100%; object-fit:cover; display:block; }
+            .osmp-greet-text { display:flex; flex-direction:column; gap:.3rem; }
+            .osmp-greet-actions { display:flex; gap:.5rem; flex-wrap:wrap; justify-content:flex-end; }
+            .osmp-login-options { display:flex; flex-wrap:wrap; gap:.75rem; align-items:flex-start; }
+            .osmp-avatar-login { display:flex; flex-direction:column; gap:.4rem; background: var(--field); border:1px solid var(--border); padding:.6rem .75rem; border-radius:6px; box-shadow: var(--shadow); max-width:320px; }
+            .osmp-avatar-login__row { display:flex; flex-wrap:wrap; gap:.5rem; align-items:center; }
+            .osmp-avatar-login input[type="text"] { flex:1; min-width:220px; background: var(--bg); color: var(--text); border:1px solid var(--border); border-radius:6px; padding:.4rem .55rem; }
+            .osmp-avatar-login input[type="text"]::placeholder { color: var(--muted); }
+            .osmp-avatar-login label { font-size:.85rem; color: var(--muted); }
+            .osmp-avatar-login__help { margin:0; font-size:.8rem; }
+            .osmp-btn-secondary { background: transparent; color: var(--accent); border:1px solid var(--accent); }
+            .osmp-btn-secondary:hover { background: var(--accent); color: var(--accent-contrast); }
 
             .osmp-filters {
                 display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0;
@@ -781,6 +1122,7 @@ class OpenSimMarketplace {
                 overflow:hidden; border-radius:6px;
                 border: 1px solid var(--border);
             }
+            .osmp-thumb img, .osmp-thumb .osmp-thumb-img { width: 100%; height: 100%; object-fit: cover; display: block; }
             .osmp-thumb--ph {
                 width: 100%; height: 100%;
                 background:
@@ -803,9 +1145,12 @@ class OpenSimMarketplace {
 
         <script>
         (function() {
-            const root = document.currentScript.closest('.osmp-market');
+            const root = document.getElementById(<?php echo json_encode($instance_id); ?>);
+            if (!root) return;
             const ajaxUrl = <?php echo json_encode($ajax_url); ?>;
             const nonce   = <?php echo json_encode($nonce); ?>;
+            const loginNonce = <?php echo json_encode($avatar_login_nonce); ?>;
+            const loginUrl = <?php echo json_encode($login_url); ?>;
             const msgEl   = root.querySelector('.osmp-msg');
 
             function setMsg(text, ok) {
@@ -815,6 +1160,22 @@ class OpenSimMarketplace {
             }
 
             root.addEventListener('click', async function(e) {
+                const loginBtn = e.target.closest('.osmp-open-login');
+                if (loginBtn) {
+                    e.preventDefault();
+                    const loginForm = root.querySelector('.osmp-avatar-login');
+                    if (loginForm) {
+                        loginForm.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        const input = loginForm.querySelector('input[name="avatar_uuid"]');
+                        if (input) {
+                            input.focus();
+                        }
+                    } else if (loginUrl) {
+                        window.location.href = loginUrl;
+                    }
+                    return;
+                }
+
                 const btn = e.target.closest('.osmp-buy');
                 if (!btn) return;
                 e.preventDefault();
@@ -831,13 +1192,33 @@ class OpenSimMarketplace {
                     form.append('_wpnonce', nonce);
 
                     const resp = await fetch(ajaxUrl, { method: 'POST', body: form, credentials: 'same-origin' });
-                    const data = await resp.json();
+                    const text = await resp.text();
+                    let data = null;
 
-                    if (data && data.success) {
-                        setMsg((data.data?.message || 'Purchase successful') + ' (Order #' + (data.data?.order_id || '?') + ')', true);
+                    if (text) {
+                        try {
+                            data = JSON.parse(text);
+                        } catch (parseError) {
+                            const trimmed = text.trim();
+                            if (trimmed !== '') {
+                                setMsg(trimmed, resp.ok);
+                            } else {
+                                setMsg(resp.ok ? 'Empty response from server' : 'Purchase failed (HTTP ' + resp.status + ')', false);
+                            }
+                            return;
+                        }
+                    }
+
+                    if (data && typeof data === 'object' && 'success' in data) {
+                        if (data.success) {
+                            setMsg((data.data?.message || 'Purchase successful') + ' (Order #' + (data.data?.order_id || '?') + ')', true);
+                        } else {
+                            const err = data.data || data.message || 'Purchase failed';
+                            setMsg(typeof err === 'string' ? err : 'Purchase failed', false);
+                        }
                     } else {
-                        const err = data && data.data ? data.data : (data && data.message ? data.message : 'Purchase failed');
-                        setMsg(err, false);
+                        const fallback = text && text.trim() !== '' ? text.trim() : 'Unexpected response from server';
+                        setMsg(fallback, resp.ok);
                     }
                 } catch (err) {
                     setMsg('Network or server error during purchase', false);
@@ -845,6 +1226,130 @@ class OpenSimMarketplace {
                     btn.disabled = false;
                 }
             }, false);
+
+            root.addEventListener('submit', async function(e) {
+                const formEl = e.target;
+                if (!formEl.classList || !formEl.classList.contains('osmp-avatar-login')) {
+                    return;
+                }
+
+                e.preventDefault();
+                const input = formEl.querySelector('input[name="avatar_uuid"]');
+                if (!input) {
+                    return;
+                }
+
+                const uuid = input.value.trim();
+                if (!uuid) {
+                    setMsg('Please enter your avatar UUID.', false);
+                    return;
+                }
+
+                const submitBtn = formEl.querySelector('button[type="submit"]');
+                if (submitBtn) {
+                    submitBtn.disabled = true;
+                }
+                setMsg('Signing in...', true);
+
+                try {
+                    const formData = new FormData();
+                    formData.append('action', 'osmp_avatar_login');
+                    formData.append('_wpnonce', loginNonce);
+                    formData.append('avatar_uuid', uuid);
+
+                    const resp = await fetch(ajaxUrl, { method: 'POST', body: formData, credentials: 'same-origin' });
+                    const text = await resp.text();
+                    let data = null;
+
+                    if (text) {
+                        try {
+                            data = JSON.parse(text);
+                        } catch (parseError) {
+                            const trimmed = text.trim();
+                            if (trimmed !== '') {
+                                setMsg(trimmed, false);
+                            } else {
+                                setMsg(resp.ok ? 'Empty response from server' : 'Login failed (HTTP ' + resp.status + ')', false);
+                            }
+                            return;
+                        }
+                    }
+
+                    if (data && typeof data === 'object' && 'success' in data) {
+                        if (data.success) {
+                            const displayName = (data.data && (data.data.name || data.data.display)) || uuid;
+                            setMsg('Signed in as ' + displayName + '. Reloading…', true);
+                            setTimeout(() => { window.location.reload(); }, 500);
+                        } else {
+                            const err = data.data || data.message || 'Login failed';
+                            setMsg(typeof err === 'string' ? err : 'Login failed', false);
+                        }
+                    } else {
+                        const fallback = text && text.trim() !== '' ? text.trim() : 'Unexpected response from server';
+                        setMsg(fallback, resp.ok);
+                    }
+                } catch (err) {
+                    setMsg('Network or server error during login', false);
+                } finally {
+                    if (submitBtn) {
+                        submitBtn.disabled = false;
+                    }
+                }
+            }, false);
+
+            const avatarLogout = root.querySelector('.osmp-avatar-logout');
+            if (avatarLogout) {
+                avatarLogout.addEventListener('click', async function(e) {
+                    e.preventDefault();
+                    if (avatarLogout.disabled) {
+                        return;
+                    }
+
+                    avatarLogout.disabled = true;
+                    setMsg('Signing out...', true);
+
+                    try {
+                        const form = new FormData();
+                        form.append('action', 'osmp_avatar_logout');
+                        form.append('_wpnonce', loginNonce);
+
+                        const resp = await fetch(ajaxUrl, { method: 'POST', body: form, credentials: 'same-origin' });
+                        const text = await resp.text();
+                        let data = null;
+
+                        if (text) {
+                            try {
+                                data = JSON.parse(text);
+                            } catch (parseError) {
+                                const trimmed = text.trim();
+                                if (trimmed !== '') {
+                                    setMsg(trimmed, false);
+                                } else {
+                                    setMsg(resp.ok ? 'Empty response from server' : 'Logout failed (HTTP ' + resp.status + ')', false);
+                                }
+                                return;
+                            }
+                        }
+
+                        if (data && typeof data === 'object' && 'success' in data) {
+                            if (data.success) {
+                                setMsg('Signed out. Reloading…', true);
+                                setTimeout(() => { window.location.reload(); }, 400);
+                            } else {
+                                const err = data.data || data.message || 'Logout failed';
+                                setMsg(typeof err === 'string' ? err : 'Logout failed', false);
+                            }
+                        } else {
+                            const fallback = text && text.trim() !== '' ? text.trim() : 'Unexpected response from server';
+                            setMsg(fallback, resp.ok);
+                        }
+                    } catch (err) {
+                        setMsg('Network or server error during logout', false);
+                    } finally {
+                        avatarLogout.disabled = false;
+                    }
+                }, false);
+            }
         })();
         </script>
         <?php
@@ -907,6 +1412,28 @@ class OpenSimMarketplace {
             }
         }
 
+        if (isset($_POST['osmp_remove_duplicates'])) {
+            check_admin_referer('osmp_remove_duplicates', '_wpnonce_osmp_remove_duplicates');
+            $dedupe_result = $this->remove_duplicate_items();
+
+            $summary = sprintf(
+                'Checked %d prim UUID groups. Removed %d duplicate items%s.',
+                $dedupe_result['groups'],
+                $dedupe_result['removed'],
+                $dedupe_result['errors'] > 0
+                    ? sprintf(' (%d items could not be trashed; see debug.log)', $dedupe_result['errors'])
+                    : ''
+            );
+
+            $highlight = '';
+            if (!empty($dedupe_result['prim_uuids'])) {
+                $sample = array_slice($dedupe_result['prim_uuids'], 0, 5);
+                $highlight = '<br><em>Affected prim UUIDs (sample): ' . esc_html(implode(', ', $sample)) . '</em>';
+            }
+
+            echo '<div class="notice notice-success"><p>' . esc_html($summary) . $highlight . '</p></div>';
+        }
+
         // Manual sync trigger
         if (isset($_POST['osmp_sync_now']) && check_admin_referer('osmp_sync_now', '_wpnonce_osmp_sync')) {
             $regions_to_sync = [];
@@ -965,6 +1492,11 @@ class OpenSimMarketplace {
         echo '<input type="submit" class="button" name="osmp_sync_now" value="Sync Now">';
         echo '</form></p>';
 
+        echo '<p><form method="post" style="display:inline-block;margin-right:10px">';
+        wp_nonce_field('osmp_remove_duplicates', '_wpnonce_osmp_remove_duplicates');
+        echo '<input type="submit" class="button" name="osmp_remove_duplicates" value="Remove Duplicate Items">';
+        echo '</form></p>';
+
         echo '<h2 class="nav-tab-wrapper">';
         foreach ($allowed_tabs as $allowed_tab) {
             $active = ($tab === $allowed_tab) ? 'nav-tab-active' : '';
@@ -996,6 +1528,7 @@ class OpenSimMarketplace {
             update_option('osmp_money_db_host', sanitize_text_field($_POST['osmp_money_db_host']));
             update_option('osmp_money_db_user', sanitize_text_field($_POST['osmp_money_db_user']));
             update_option('osmp_money_db_name', sanitize_text_field($_POST['osmp_money_db_name']));
+            update_option('osmp_texture_proxy_template', sanitize_text_field($_POST['osmp_texture_proxy_template'] ?? ''));
 
             if (!empty($_POST['osmp_delivery_api_password'])) {
                 update_option('osmp_delivery_api_password', $this->encrypt_option(sanitize_text_field($_POST['osmp_delivery_api_password'])));
@@ -1037,13 +1570,24 @@ class OpenSimMarketplace {
                     </tr>
                 </table>
 
+                <h2>Avatar Login &amp; Media</h2>
+                <table class="form-table">
+                    <tr>
+                        <th><label for="osmp_texture_proxy_template">Texture Proxy URL</label></th>
+                        <td>
+                            <input type="text" id="osmp_texture_proxy_template" name="osmp_texture_proxy_template" value="<?php echo esc_attr(get_option('osmp_texture_proxy_template', '')); ?>" class="regular-text" placeholder="https://proxy.example/texture/{uuid}" />
+                            <p class="description">Used to display avatar portraits and item previews from UUIDs. Include <code>{uuid}</code> where the texture UUID should be inserted. If omitted, the UUID will be appended to the end of the URL.</p>
+                        </td>
+                    </tr>
+                </table>
+
                 <h2>Region Synchronisation</h2>
                 <table class="form-table">
                     <tr>
                         <th><label for="osmp_region_uuids">Region UUIDs</label></th>
                         <td>
-                            <textarea id="osmp_region_uuids" name="osmp_region_uuids" rows="4" class="large-text code" placeholder="e.g. c6baa58b-59a4-4a02-9907-6baaf6cfead7&#10;another-region-uuid"><?php echo esc_textarea((string) get_option('osmp_region_uuids', get_option('osmp_region_uuid', ''))); ?></textarea>
-                            <p class="description">Provide one region UUID per line. Optionally append a friendly name after a pipe (<code>|</code>) to label the region in the marketplace (e.g. <code>uuid|Main Store</code>). Legacy single-region setups can leave this with a single UUID.</p>
+                            <textarea id="osmp_region_uuids" name="osmp_region_uuids" rows="4" class="large-text code" placeholder="e.g. c6baa58b-59a4-4a02-9907-6baaf6cfead7&#10;another-region-uuid|Main Store&#10;third-region-uuid|Outlet|https://grid.example/send"><?php echo esc_textarea((string) get_option('osmp_region_uuids', get_option('osmp_region_uuid', ''))); ?></textarea>
+                            <p class="description">Provide one region UUID per line. Optionally append a friendly name after a pipe (<code>|</code>) to label the region in the marketplace (e.g. <code>uuid|Main Store</code>). Add a second pipe followed by a delivery API base URL to override the global endpoint for that region (e.g. <code>uuid||https://grid.example/send</code>).</p>
                         </td>
                     </tr>
                     <tr>
@@ -1686,15 +2230,132 @@ class OpenSimMarketplace {
         }
     }
 
+    private function remove_duplicate_items(): array {
+        global $wpdb;
+
+        $result = [
+            'groups'     => 0,
+            'removed'    => 0,
+            'errors'     => 0,
+            'prim_uuids' => [],
+        ];
+
+        try {
+            $query = $wpdb->prepare(
+                "SELECT pm.meta_value AS prim_uuid,
+                        GROUP_CONCAT(pm.post_id ORDER BY p.post_date ASC SEPARATOR ',') AS post_ids,
+                        COUNT(*) AS duplicates
+                   FROM {$wpdb->postmeta} pm
+                   INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+                  WHERE pm.meta_key = %s
+                    AND p.post_type = %s
+                    AND p.post_status <> 'trash'
+                    AND pm.meta_value <> ''
+               GROUP BY pm.meta_value
+                 HAVING COUNT(*) > 1",
+                '_prim_uuid',
+                'opensim_item'
+            );
+
+            $rows = (array) $wpdb->get_results($query);
+
+            foreach ($rows as $row) {
+                $prim_uuid = (string) $row->prim_uuid;
+                if (!$this->is_valid_uuid($prim_uuid)) {
+                    continue;
+                }
+
+                $ids = array_filter(array_map('intval', explode(',', (string) $row->post_ids)));
+                if (count($ids) < 2) {
+                    continue;
+                }
+
+                $result['groups']++;
+                $result['prim_uuids'][] = $prim_uuid;
+
+                $keep_id = array_shift($ids);
+
+                foreach ($ids as $post_id) {
+                    if ($post_id === $keep_id) {
+                        continue;
+                    }
+
+                    $trashed = wp_trash_post($post_id);
+                    if ($trashed instanceof \WP_Post || $trashed === true) {
+                        $result['removed']++;
+                    } elseif ($trashed instanceof \WP_Error) {
+                        $result['errors']++;
+                        error_log('OpenSim Marketplace: Failed to trash duplicate post ' . $post_id . ' for prim ' . $prim_uuid . ': ' . $trashed->get_error_message());
+                    } else {
+                        $result['errors']++;
+                        error_log('OpenSim Marketplace: Failed to trash duplicate post ' . $post_id . ' for prim ' . $prim_uuid);
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            error_log('OpenSim Marketplace: Error removing duplicate items: ' . $e->getMessage());
+        }
+
+        return $result;
+    }
+
+    // ---- Avatar Login ----
+    public function handle_avatar_login(): void {
+        if (!isset($_POST['_wpnonce']) || !wp_verify_nonce(sanitize_text_field((string) $_POST['_wpnonce']), 'osmp_avatar_login')) {
+            wp_send_json_error('Security check failed');
+        }
+
+        $uuid = isset($_POST['avatar_uuid']) ? sanitize_text_field((string) $_POST['avatar_uuid']) : '';
+        $uuid = trim($uuid);
+
+        if ($uuid === '' || !$this->is_valid_uuid($uuid)) {
+            wp_send_json_error('Invalid avatar UUID');
+        }
+
+        $avatar_name = $this->get_avatar_name($uuid);
+
+        $this->issue_avatar_session($uuid);
+        $balance = $this->get_user_balance($uuid);
+        $image = $this->get_texture_proxy_url($uuid);
+
+        $display = $avatar_name ?: $uuid;
+        $payload = [
+            'uuid'    => $uuid,
+            'name'    => $display,
+            'display' => $display,
+            'balance' => $balance,
+        ];
+
+        if ($avatar_name !== null) {
+            $payload['avatar_name'] = $avatar_name;
+        }
+        if ($image) {
+            $payload['image'] = $image;
+        }
+        if ($avatar_name === null && $this->os_db) {
+            $payload['warning'] = 'Avatar record not found; proceeding with UUID only.';
+        }
+
+        wp_send_json_success($payload);
+    }
+
+    public function handle_avatar_logout(): void {
+        if (!isset($_POST['_wpnonce']) || !wp_verify_nonce(sanitize_text_field((string) $_POST['_wpnonce']), 'osmp_avatar_login')) {
+            wp_send_json_error('Security check failed');
+        }
+
+        $this->clear_avatar_session();
+        wp_send_json_success(['message' => 'Logged out']);
+    }
+
     // ---- Purchase Handling ----
     public function handle_purchase(): void {
-        if (!is_user_logged_in()) { wp_send_json_error('Authentication required'); }
-        if (!isset($_POST['_wpnonce']) || !wp_verify_nonce(sanitize_text_field($_POST['_wpnonce']), 'osmp_purchase')) { wp_send_json_error('Security check failed'); }
+        if (!isset($_POST['_wpnonce']) || !wp_verify_nonce(sanitize_text_field((string) $_POST['_wpnonce']), 'osmp_purchase')) { wp_send_json_error('Security check failed'); }
         if (!$this->money_db) { wp_send_json_error('Service temporarily unavailable'); }
 
-        $user_id = get_current_user_id();
-        $buyer_uuid = get_user_meta($user_id, '_w4os_avatar_uuid', true);
-        if (empty($buyer_uuid) || !$this->is_valid_uuid($buyer_uuid)) { wp_send_json_error('Invalid buyer UUID'); }
+        $buyer_context = $this->resolve_buyer_context();
+        $buyer_uuid = $buyer_context['uuid'] ?? '';
+        if (empty($buyer_uuid) || !$this->is_valid_uuid($buyer_uuid)) { wp_send_json_error('Authentication required'); }
 
         $item_id = isset($_POST['item_id']) ? intval($_POST['item_id']) : 0;
         if ($item_id <= 0) { wp_send_json_error('Invalid item ID'); }
@@ -1708,15 +2369,9 @@ class OpenSimMarketplace {
         $region_uuid = get_post_meta($item_id, '_region_uuid', true);
         $item_name = is_object($item) ? (string) $item->post_title : '';
 
-        $buyer_display = '';
-        if (function_exists('wp_get_current_user')) {
-            $current_user = wp_get_current_user();
-            if ($current_user && $current_user->exists()) {
-                $buyer_display = trim((string) $current_user->display_name);
-                if ($buyer_display === '') {
-                    $buyer_display = trim((string) $current_user->user_login);
-                }
-            }
+        $buyer_display = $buyer_context['display'] ?? '';
+        if ($buyer_display === '' && !empty($buyer_context['avatar_name'])) {
+            $buyer_display = (string) $buyer_context['avatar_name'];
         }
         if ($buyer_display === '') {
             $buyer_display = $this->resolve_avatar_display($buyer_uuid);
@@ -1782,7 +2437,8 @@ class OpenSimMarketplace {
             if (!$this->is_valid_uuid($buyer_uuid)) {
                 throw new Exception('Invalid buyer UUID for delivery');
             }
-            if ($this->delivery_api_url === '') {
+            $delivery_api_base = $this->get_region_delivery_api_url($region_uuid);
+            if ($delivery_api_base === '') {
                 throw new Exception('Delivery API URL is not configured');
             }
 
@@ -1801,7 +2457,7 @@ class OpenSimMarketplace {
                 $query['region'] = $region_uuid;
             }
 
-            $request_url = add_query_arg(array_map(static fn($value) => is_scalar($value) ? (string) $value : '', $query), $this->delivery_api_url);
+            $request_url = add_query_arg(array_map(static fn($value) => is_scalar($value) ? (string) $value : '', $query), $delivery_api_base);
 
             $response = wp_remote_get($request_url, [
                 'timeout' => 30,
@@ -1888,9 +2544,28 @@ class OpenSimMarketplace {
             return $avatar_uuid;
         }
 
+        $meta_keys  = $this->get_avatar_meta_keys();
+        $meta_query = ['relation' => 'OR'];
+        foreach ($meta_keys as $meta_key) {
+            $meta_query[] = [
+                'key'     => $meta_key,
+                'value'   => $avatar_uuid,
+                'compare' => '=',
+            ];
+        }
+
+        if (count($meta_query) === 1) {
+            $meta_query[] = [
+                'key'     => '_w4os_avatar_uuid',
+                'value'   => $avatar_uuid,
+                'compare' => '=',
+            ];
+        }
+
+        $meta_query = apply_filters('osmp_avatar_display_meta_query', $meta_query, $avatar_uuid, $this);
+
         $users = get_users([
-            'meta_key'   => '_w4os_avatar_uuid',
-            'meta_value' => $avatar_uuid,
+            'meta_query' => $meta_query,
             'number'     => 1,
         ]);
 
